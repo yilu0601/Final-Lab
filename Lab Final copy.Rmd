@@ -1,0 +1,154 @@
+---
+title: "Lab Final"
+author: "Irene"
+date: "2024-05-30"
+output: html_document
+---
+
+```{r}
+library(caret)
+library(glmnet)
+set.seed(1234)
+data <- read.csv("Competition_data.csv")
+
+# Remove ID and zip code
+data <- subset(data, select = -c(HHKEY, ZIP_CODE))
+# Change to factors
+data$CC_CARD <- as.factor(data$CC_CARD)
+data$WEB <- as.factor(data$WEB)
+data$RESP <- as.factor(data$RESP)
+data$CLUSTYPE <- as.factor(data$CLUSTYPE)
+
+# Convert VALPHON to a single dummy variable
+data$VALPHON <- ifelse(data$VALPHON == "Y", 1, 0)
+
+# Dummy variables for CLUSTYPE
+dummy_matrix <- model.matrix(~ CLUSTYPE - 1, data = data)
+# Combine dummy variables with the original dataframe
+data <- cbind(data, dummy_matrix)
+
+# Remove the original factor column if needed
+data$CLUSTYPE <- NULL
+
+# Split data into training and testing sets
+train_indices <- createDataPartition(data$RESP, p = 0.8, list = FALSE)
+train_data <- data[train_indices, ]
+test_data <- data[-train_indices, ]
+
+```
+
+Scale data
+```{r}
+# scale using FITTED scaler to train_data
+preProc <- preProcess(subset(train_data, select = -c(RESP, CC_CARD, WEB, CLUSTYPE1, CLUSTYPE2, CLUSTYPE3, CLUSTYPE4, CLUSTYPE5, CLUSTYPE6, CLUSTYPE7, VALPHON)), method = c("center", "scale"))
+
+# Transform data
+train_scaled <- predict(preProc, train_data)
+test_scaled <- predict(preProc, test_data)
+```
+
+Lasso regression to find optimal lambda and then select variables
+```{r}
+set.seed(1234)
+# Versions of train and test
+X_train <- subset(train_scaled, select = -RESP)
+X_test <- subset(test_scaled, select = -RESP)
+
+X_train$WEB <- as.numeric(X_train$WEB)
+X_train$VALPHON <- as.numeric(X_train$VALPHON)
+X_train$CC_CARD <- as.numeric(X_train$CC_CARD)
+
+y_train <- train_scaled$RESP
+y_test <- test_scaled$RESP
+
+# Lasso to find predictors
+# Fit Lasso model using cross-validation to find the optimal lambda
+cv_fit <- cv.glmnet(as.matrix(X_train), y_train, alpha = 1, standardize = FALSE, family = "binomial")
+
+# Get the best lambda value
+best_lambda <- cv_fit$lambda.min
+
+# Fit the Lasso model with the best lambda
+lasso_model <- glmnet(X_train, y_train, alpha = 1, lambda = best_lambda, standardize = FALSE, family = "binomial")
+
+# Get the coefficients
+coef_lasso <- coef(lasso_model)
+selected_variables <- as.data.frame(as.matrix(coef_lasso))
+selected_variables <- as.data.frame(t(selected_variables))
+
+non_zero_columns <- apply(selected_variables, 2, function(col) !all(col == 0))
+
+# Get nonzero coefficients
+non_zero_coef <- selected_variables[, non_zero_columns]
+
+# Get the names of the non-zero features
+non_zero_features <- colnames(non_zero_coef)
+non_zero_features
+
+# Modify training and testing data to include only selected variables 
+non_zero_features <- non_zero_features[non_zero_features != "(Intercept)"] 
+select <- c("RESP", non_zero_features)
+
+train_scaled <- subset(train_scaled, select = select)
+train_scaled$CLUSTYPE7 <- as.factor(train_scaled$CLUSTYPE7)
+test_scaled <- subset(test_scaled, select = select)
+test_scaled$CLUSTYPE7 <- as.factor(test_scaled$CLUSTYPE7)
+
+```
+
+Random Forest
+```{r}
+library(randomForest)
+set.seed(1234)
+
+train_control <- trainControl(method = "cv", number = 5, classProbs = TRUE, summaryFunction = twoClassSummary)
+
+rf <- randomForest(RESP ~ ., data = train_scaled, family = "binomial", trControl = train_control, ntree = 500, metric = "ROC")
+save(rf, file = "rf.Rdata")
+predictions <- predict(rf, newdata = test_scaled, type = "prob")
+```
+
+Prediction
+```{r}
+cutoff <- 0.21
+pred <- ifelse(predictions[,2] > cutoff, 1, 0) # convert to standard predictions format, only need the X1 column
+pred <- as.factor(pred) # make into a factor (for confusion matrix)
+
+TP <- sum(pred == 1 & y_test == 1)
+FP <- sum(pred == 1 & y_test == 0)
+TN <- sum(pred == 0 & y_test == 0)
+FN <- sum(pred == 0 & y_test == 1)
+
+profit_dt <- 170 * TP - 30 * (TP + FP)
+print(profit_dt)
+print(paste("TP:", TP, "FP:", FP, "TN:", TN, "FN:", FN))
+accuracy <- (TP + TN) / (TP + TN + FP + FN)
+
+# Extra performance metrics
+percent_TP_captured = TP / sum(y_test == 1) # the percent of TP we actually predict
+loss_FP = 30 * FP # the amount we waste on FP
+profit_TP = 140 * TP # the amount we gain from TP without the cost
+max_profit = 140 * sum(y_test == 1)
+potential_profit = max_profit - profit_dt
+
+print(paste("Percent TP captured:", percent_TP_captured))
+print(paste("Loss from FP:", loss_FP))
+print(paste("Profit from TP:",profit_TP))
+print(paste("Potential Profit Left:",potential_profit))
+print(paste("Accuracy:", accuracy))
+
+```
+
+Logistic Baseline
+```{r}
+# Logistic
+logistic <- glm(RESP ~. , data = train_data, family = binomial)
+predictions <- predict(logistic, newdata = test_data, type = "response")
+predicted_label <- ifelse(predictions > 0.5, "1", "0")
+confusionMatrix(as.factor(predicted_label), test_data$RESP)
+
+TP <- sum(predicted_label == 1 & test_data$RESP == 1)
+FP <- sum(predicted_label == 1 & test_data$RESP == 0)
+profit <- 170 * TP - 30 * (TP + FP)
+profit
+```
